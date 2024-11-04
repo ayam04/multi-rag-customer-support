@@ -20,44 +20,62 @@ mongo_client = MongoClient(os.getenv('MONGODB_URI', 'mongodb://localhost:27017/'
 mongo_db = mongo_client['alphagpt']
 
 VECTOR_DIMENSION = 384
-FAISS_INDEX_PATH = "faiss_index.bin"
-DOCUMENTS_PATH = "stored_documents.pkl"
+FAISS_FOLDER = "FAISS"
+FAISS_INDEX_PATH = os.path.join(FAISS_FOLDER, "faiss_index.index")
+DOCUMENTS_PATH = os.path.join(FAISS_FOLDER, "stored_documents.pkl")
 
-# Initialize or load FAISS index
-if os.path.exists(FAISS_INDEX_PATH):
-    index = faiss.read_binary(FAISS_INDEX_PATH)
-    with open(DOCUMENTS_PATH, 'rb') as f:
-        stored_documents = pickle.load(f)
+os.makedirs(FAISS_FOLDER, exist_ok=True)
+
+if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(DOCUMENTS_PATH):
+    try:
+        index = faiss.read_index(FAISS_INDEX_PATH)
+        with open(DOCUMENTS_PATH, 'rb') as f:
+            stored_documents = pickle.load(f)
+    except Exception as e:
+        print(f"Error loading FAISS state: {e}")
+        index = faiss.IndexFlatL2(VECTOR_DIMENSION)
+        stored_documents = []
 else:
     index = faiss.IndexFlatL2(VECTOR_DIMENSION)
     stored_documents = []
 
 def save_faiss_state():
-    """Save FAISS index and documents to disk."""
-    faiss.write_binary(index, FAISS_INDEX_PATH)
-    with open(DOCUMENTS_PATH, 'wb') as f:
-        pickle.dump(stored_documents, f)
-    print("FAISS state saved successfully!")
+    try:
+        faiss.write_index(index, FAISS_INDEX_PATH)
+        with open(DOCUMENTS_PATH, 'wb') as f:
+            pickle.dump(stored_documents, f)
+        print("FAISS state saved successfully!")
+    except Exception as e:
+        print(f"Error saving FAISS state: {e}")
 
 def extract_text_from_video(video_path: str) -> str:
-    """Extracts and transcribes audio from video using Whisper base model."""
     try:
         whisper_model = whisper.load_model("base")
         video = VideoFileClip(video_path)
         audio = video.audio
-        audio_path = "temp_audio.wav"
-        audio.write_audiofile(audio_path)
+        temp_dir = os.path.join(FAISS_FOLDER, "temp")
+        os.makedirs(temp_dir, exist_ok=True)
         
-        result = whisper_model.transcribe(audio_path)
+        audio_path = os.path.normpath(os.path.join(temp_dir, "temp_audio.wav")).replace("\\", "/")
         
-        os.remove(audio_path)
-        return result["text"]
+        try:
+            audio.write_audiofile(audio_path, logger=None)
+            result = whisper_model.transcribe(audio_path)
+            return result["text"]
+        finally:
+            # Cleanup
+            if os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except Exception as e:
+                    print(f"Warning: Could not delete temporary audio file: {e}")
+            video.close()
+            
     except Exception as e:
         print(f"Error processing video {video_path}: {str(e)}")
         return ""
 
 def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extracts text from a PDF file."""
     try:
         with open(pdf_path, 'rb') as file:
             pdf_reader = PyPDF2.PdfReader(file)
@@ -70,73 +88,87 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         return ""
 
 def process_folder_content(folder_path: str, content_type: str) -> List[Dict]:
-    """Processes folder contents based on content type (video, pdf, text)."""
     content_data = []
+    folder_path = os.path.normpath(folder_path)
     
     if not os.path.exists(folder_path):
+        print(f"Warning: Folder {folder_path} does not exist")
         return content_data
         
     for filename in os.listdir(folder_path):
-        file_path = os.path.join(folder_path, filename)
+        file_path = os.path.normpath(os.path.join(folder_path, filename))
         
-        if content_type == 'video' and filename.endswith(('.mp4', '.avi', '.mov')):
-            text_content = extract_text_from_video(file_path)
-        elif content_type == 'pdf' and filename.endswith('.pdf'):
-            text_content = extract_text_from_pdf(file_path)
-        elif content_type == 'text' and filename.endswith('.txt'):
-            with open(file_path, 'r', encoding='utf-8') as file:
-                text_content = file.read()
-        else:
+        try:
+            if content_type == 'video' and filename.endswith(('.mp4', '.avi', '.mov')):
+                text_content = extract_text_from_video(file_path)
+            elif content_type == 'pdf' and filename.endswith('.pdf'):
+                text_content = extract_text_from_pdf(file_path)
+            elif content_type == 'text' and filename.endswith('.txt'):
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    text_content = file.read()
+            else:
+                continue
+                
+            if text_content:
+                embedding = model.encode(text_content)
+                content_data.append({
+                    'filename': filename,
+                    'content': text_content,
+                    'embedding': embedding.tolist(),
+                    'type': content_type
+                })
+                print(f"Successfully processed: {filename}")
+            else:
+                print(f"Warning: No content extracted from {filename}")
+                
+        except Exception as e:
+            print(f"Error processing {filename}: {str(e)}")
             continue
-            
-        if text_content:
-            embedding = model.encode(text_content)
-            content_data.append({
-                'filename': filename,
-                'content': text_content,
-                'embedding': embedding.tolist(),
-                'type': content_type
-            })
     
     return content_data
 
+
 def initialize_local_vectordb(content_data: List[Dict]):
-    """Initializes local FAISS vector database with embeddings."""
     global index, stored_documents
     
     if not content_data:
+        print("No content data provided for initialization")
         return
         
-    index = faiss.IndexFlatL2(VECTOR_DIMENSION)
-    stored_documents = []
-    
-    vectors = [np.array(item['embedding'], dtype=np.float32) for item in content_data]
-    index.add(np.vstack(vectors))
-    
-    stored_documents.extend(content_data)
-    
-    # Save state to disk
-    save_faiss_state()
-    print("Local vector database initialized successfully!")
+    try:
+        index = faiss.IndexFlatL2(VECTOR_DIMENSION)
+        stored_documents = []
+        
+        vectors = [np.array(item['embedding'], dtype=np.float32) for item in content_data]
+        index.add(np.vstack(vectors))
+        
+        stored_documents.extend(content_data)
+        
+        save_faiss_state()
+        print("Local vector database initialized successfully!")
+    except Exception as e:
+        print(f"Error initializing local vector database: {str(e)}")
 
 def create_vector_database():
-    """Process content and initialize local vector store."""
     try:
-        # Process content from different sources
+        os.makedirs(FAISS_FOLDER, exist_ok=True)
+        os.makedirs(os.path.join(FAISS_FOLDER, "temp"), exist_ok=True)
+        
         video_data = process_folder_content('videos', 'video')
-        pdf_data = process_folder_content('documents/pdfs', 'pdf')
-        text_data = process_folder_content('documents/texts', 'text')
+        pdf_data = process_folder_content(os.path.join('documents', 'pdfs'), 'pdf')
+        text_data = process_folder_content(os.path.join('documents', 'texts'), 'text')
         
         all_content = video_data + pdf_data + text_data
         
         if all_content:
             initialize_local_vectordb(all_content)
-            print("Vector database created successfully!")
+            print(f"Vector database created successfully with {len(all_content)} documents!")
         else:
             print("No content found to process!")
             
     except Exception as e:
         print(f"Error creating vector database: {str(e)}")
+        raise
 
 def get_platform_type(query: str) -> str:
     db_keywords = ['find', 'search', 'lookup', 'get', 'query', 'database', 
@@ -147,13 +179,6 @@ def get_platform_type(query: str) -> str:
     return "vector"
 
 def search_mongodb_platform(query: str, collection_name: str) -> str:
-    """
-    Search MongoDB in a specified collection.
-    
-    Args:
-        query: Search query string
-        collection_name: Name of the MongoDB collection to search in
-    """
     try:
         if not collection_name:
             return "No collection name provided for MongoDB search."
@@ -163,10 +188,10 @@ def search_mongodb_platform(query: str, collection_name: str) -> str:
         
         content_results = list(collection.find({
             "$or": [
-                {"$text": {"$search": " ".join(keywords)}},  # If text index exists
+                {"$text": {"$search": " ".join(keywords)}},
                 {"$or": [
                     {field: {"$regex": "|".join(keywords), "$options": "i"}} 
-                    for field in collection.find_one({}).keys()  # Search all fields
+                    for field in collection.find_one({}).keys()
                     if field != "_id"
                 ]}
             ]
@@ -184,7 +209,6 @@ def search_mongodb_platform(query: str, collection_name: str) -> str:
         return f"Error searching MongoDB collection '{collection_name}': {str(e)}"
 
 def search_vector_database(query: str) -> str:
-    """Search local vector database using FAISS."""
     try:
         if not stored_documents:
             return "No content available in vector database."
@@ -204,7 +228,6 @@ def search_vector_database(query: str) -> str:
         return f"Error searching vector database: {str(e)}"
 
 def generate_response(context: str, query: str) -> str:
-    """Generate a response using OpenAI GPT model."""
     try:
         messages = [
             {"role": "system", "content": "You are a helpful customer support assistant chatbot. Provide clear, concise answers based only on the context provided. Also provide a clear and helpful response to the user's question."},

@@ -6,3 +6,5 @@ python-dotenv
 PyPDF2
 sentence-transformers==2.2.2
 moviepy==1.0.3
+openai-whisper==20231117
+numpy
