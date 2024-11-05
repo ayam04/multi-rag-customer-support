@@ -4,14 +4,18 @@ import faiss
 import numpy as np
 import pickle
 from openai import OpenAI
-from typing import Dict, List
+from typing import Dict, List, Any, Tuple
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from pymongo.collection import Collection
 from moviepy.editor import VideoFileClip
 from fastapi import HTTPException, status
 from sentence_transformers import SentenceTransformer
 import whisper
 import json
+from bson.objectid import ObjectId
+from datetime import datetime
+import re
 
 load_dotenv()
 
@@ -64,7 +68,6 @@ def extract_text_from_video(video_path: str) -> str:
             result = whisper_model.transcribe(audio_path)
             return result["text"]
         finally:
-            # Cleanup
             if os.path.exists(audio_path):
                 try:
                     os.remove(audio_path)
@@ -179,34 +182,110 @@ def get_platform_type(query: str) -> str:
         return "mongodb"
     return "vector"
 
+class MongoJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+
+def get_collection_schema(collection_name: str) -> str:
+    try:
+        collection: Collection = mongo_db[collection_name]
+        sample_doc = collection.find_one()
+        
+        if not sample_doc:
+            return "Empty collection"
+            
+        if '_id' in sample_doc:
+            del sample_doc['_id']
+            
+        fields = list(sample_doc.keys())
+        schema_desc = f"Collection '{collection_name}' has the following fields:\n"
+        for field in fields:
+            value_type = type(sample_doc[field]).__name__
+            schema_desc += f"- {field} ({value_type})\n"
+            
+        total_docs = collection.count_documents({})
+        schema_desc += f"\nTotal number of documents in collection: {total_docs}"
+            
+        return schema_desc
+        
+    except Exception as e:
+        return f"Error getting collection schema: {str(e)}"
+
+def clean_query_text(query_text: str) -> str:
+    query_text = query_text.replace("```json", "").replace("```", "")
+    query_text = query_text.strip()
+    return query_text
+
+def generate_mongodb_query(collection_name: str, user_query: str) -> Dict[str, Any]:
+    try:
+        schema_context = get_collection_schema(collection_name)
+        
+        messages = [
+            {"role": "system", "content": """You are an assistant that generates MongoDB queries.
+                Generate only the query object as valid JSON. Do not include markdown formatting or code blocks.
+                For counting queries, use an empty query object {}.
+                The query should work with the provided collection schema."""},
+            {"role": "user", "content": f"""
+                Collection Schema:
+                {schema_context}
+                
+                Generate a MongoDB query object for the following user query:
+                {user_query}
+                
+                Return only the query object without any formatting or explanation.
+            """}
+        ]
+
+        response = client.chat.completions.create(
+            model="gpt-4-turbo-preview",
+            messages=messages,
+            temperature=0.1
+        )
+        
+        query_text = clean_query_text(response.choices[0].message.content)
+        print(f"Generated query: {query_text}")
+        
+        try:
+            query_dict = json.loads(query_text)
+            return query_dict
+        except json.JSONDecodeError:
+            print(f"Failed to parse generated query: {query_text}")
+            return {}
+            
+    except Exception as e:
+        print(f"Error generating MongoDB query: {str(e)}")
+        return {}
+
 def search_mongodb_platform(query: str, collection_name: str) -> str:
     try:
         if not collection_name:
             return "No collection name provided for MongoDB search."
             
-        collection = mongo_db[collection_name]
-        keywords = query.lower().split()
+        collection: Collection = mongo_db[collection_name]
         
-        content_results = list(collection.find({
-            "$or": [
-                {"$text": {"$search": " ".join(keywords)}},
-                {"$or": [
-                    {field: {"$regex": "|".join(keywords), "$options": "i"}} 
-                    for field in collection.find_one({}).keys()
-                    if field != "_id"
-                ]}
-            ]
-        }).limit(1))
+        if "how many" in query.lower() or ("total" in query.lower() and "documents" in query.lower()):
+            mongo_query = generate_mongodb_query(collection_name, query)
+            count = collection.count_documents(mongo_query)
+            return json.dumps({"matching_documents": count}, indent=4)
+        
+        mongo_query = generate_mongodb_query(collection_name, query)
+        
+        if not mongo_query:
+            return "Failed to generate a valid MongoDB query."
+        
+        content_results = list(collection.find(mongo_query).limit(5))
         
         if content_results:
-            result = content_results[0]
-            if '_id' in result:
-                del result['_id']
-            return str(result)
+            return json.dumps(content_results, indent=4, cls=MongoJSONEncoder)
             
-        return f"No relevant information found in collection '{collection_name}'."
-        
+        return f"No results found in collection '{collection_name}' for the given query."
+            
     except Exception as e:
+        print(f"Detailed error: {str(e)}")
         return f"Error searching MongoDB collection '{collection_name}': {str(e)}"
 
 def search_vector_database(query: str) -> str:
@@ -299,3 +378,38 @@ def bot_reply(category):
 
         print(f"Parsed data: {data}")
     return data
+
+def query_agent(query: str) -> Tuple[int, str]:
+    try:
+        messages = [
+            {"role": "system", "content": """You are a query classifier. Analyze the user's query and return ONLY a number (1-5) corresponding to the appropriate action:
+                1: For queries seeking information or asking questions
+                2: For requests to update or refresh the database
+                3: For requests related to sending emails
+                4: For requests to start or manage email monitoring
+                5: For requests to exit or close
+                
+                Return ONLY the number, no explanations or additional text."""},
+            {"role": "user", "content": query}
+        ]
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            temperature=0,
+            max_tokens=1
+        )
+        
+        option = response.choices[0].message.content.strip()
+        
+        match = re.search(r'\d', option)
+        if match:
+            option_num = int(match.group())
+            if 1 <= option_num <= 5:
+                return option_num, query
+                
+        return 1, query
+
+    except Exception as e:
+        print(f"Error in query agent: {str(e)}")
+        return 1, query
