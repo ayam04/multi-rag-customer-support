@@ -34,9 +34,6 @@ def process_query(query: str) -> str:
         return ""
 
 def update_database():
-    """
-    Update the vector database.
-    """
     try:
         create_vector_database()
         print(f"{Colors.GREEN}Database updated successfully.{Colors.END}")
@@ -44,9 +41,6 @@ def update_database():
         print(f"{Colors.RED}Error updating database: {str(e)}{Colors.END}")
 
 def send_emails(recipient_emails: List[str]):
-    """
-    Send emails to the specified list of recipients.
-    """
     try:
         for email in recipient_emails:
             send_email_agent(email)
